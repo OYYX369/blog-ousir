@@ -1,31 +1,41 @@
 package com.yupi.mianshiya.service.impl;
 
-import static com.yupi.mianshiya.constant.UserConstant.USER_LOGIN_STATE;
-
+import cn.dev33.satoken.stp.StpUtil;
 import cn.hutool.core.collection.CollUtil;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.yupi.mianshiya.common.ErrorCode;
 import com.yupi.mianshiya.constant.CommonConstant;
+import com.yupi.mianshiya.constant.RedisConstant;
 import com.yupi.mianshiya.exception.BusinessException;
+import com.yupi.mianshiya.exception.ThrowUtils;
 import com.yupi.mianshiya.mapper.UserMapper;
 import com.yupi.mianshiya.model.dto.user.UserQueryRequest;
 import com.yupi.mianshiya.model.entity.User;
 import com.yupi.mianshiya.model.enums.UserRoleEnum;
 import com.yupi.mianshiya.model.vo.LoginUserVO;
 import com.yupi.mianshiya.model.vo.UserVO;
+import com.yupi.mianshiya.satoken.DeviceUtils;
 import com.yupi.mianshiya.service.UserService;
 import com.yupi.mianshiya.utils.SqlUtils;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.stream.Collectors;
-import javax.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import me.chanjar.weixin.common.bean.WxOAuth2UserInfo;
 import org.apache.commons.lang3.StringUtils;
+import org.redisson.api.RBitSet;
+import org.redisson.api.RedissonClient;
 import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.util.DigestUtils;
+
+import javax.annotation.Resource;
+import javax.servlet.http.HttpServletRequest;
+import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.List;
+import java.util.stream.Collectors;
+
+import static com.yupi.mianshiya.constant.UserConstant.USER_LOGIN_STATE;
 
 /**
  * 用户服务实现
@@ -37,10 +47,79 @@ import org.springframework.util.DigestUtils;
 @Slf4j
 public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements UserService {
 
+
+    @Resource
+    RedissonClient redissonClient;
     /**
      * 盐值，混淆密码
      */
     public static final String SALT = "yupi";
+
+    /**
+     * 用户签到
+     *
+     * @param userId 用户 id
+     * @return
+     */
+    @Override
+    public boolean addUserSignIn(long userId) {
+        //获取当前日期
+        LocalDate date = LocalDate.now();
+        //封装到函数，然后转换为年份日期偏移量，得到字符串   key
+        String key = RedisConstant.getUserSignInRedisKey(date.getYear(), userId);
+        RBitSet signInBitSet = redissonClient.getBitSet(key);
+        //当前日期是一年中的第几天，作为偏移量
+        int offset = date.getDayOfYear();
+
+        if (!signInBitSet.get(offset)) {
+            //如果未签到
+            return signInBitSet.set(offset, true);
+        }
+        //当前已签到
+        return true;
+    }
+
+    /**
+     * 获取用户某个年份的签到记录
+     *
+     * @param userId 用户 id
+     * @param year   年份（为空表示当前年份）
+     * @return 签到记录映射
+     */
+    @Override
+    public List<Integer> getUserSignInRecord(long userId, Integer year) {
+        if (year == null) {
+            LocalDate date = LocalDate.now();
+            year = date.getYear();
+        }
+        String key = RedisConstant.getUserSignInRedisKey(year, userId);
+        //获得redis的bitmap
+        RBitSet signInBitSet = redissonClient.getBitSet(key);
+        // 加载 BitSet 到内存中，避免后续读取时发送多次请求
+        BitSet bitSet = signInBitSet.asBitSet();
+        // 统计日期
+        List<Integer> dayList = new ArrayList<>();
+
+//        // 获取当前年份的总天数
+//        int totalDays = Year.of(year).length();
+//        // 依次获取每一天的签到状态
+//        for (int dayOfYear = 1; dayOfYear <= totalDays; dayOfYear++) {
+//            // 获取 value：当天是否有刷题
+//            boolean hasRecord = bitSet.get(dayOfYear);
+//            if (hasRecord) {
+//                dayList.add(dayOfYear);
+//            }
+//        }
+        //计算优化，循环性能差些
+        int index = bitSet.nextSetBit(0);
+        while (index >= 0) {
+            dayList.add(index + 1);
+            index = bitSet.nextSetBit(index + 1);
+        }
+
+        return dayList;
+    }
+
 
     @Override
     public long userRegister(String userAccount, String userPassword, String checkPassword) {
@@ -105,7 +184,12 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "用户不存在或密码错误");
         }
         // 3. 记录用户的登录态
-        request.getSession().setAttribute(USER_LOGIN_STATE, user);
+//        request.getSession().setAttribute(USER_LOGIN_STATE, user);
+
+        //使用Sa-token 登录， 并指定设备，同端登录互斥
+        StpUtil.login(user.getId(),DeviceUtils.getRequestDevice(request));
+        StpUtil.getSession().set(USER_LOGIN_STATE, user);
+
         return this.getLoginUserVO(user);
     }
 
@@ -136,7 +220,10 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
                 }
             }
             // 记录用户的登录态
-            request.getSession().setAttribute(USER_LOGIN_STATE, user);
+//            request.getSession().setAttribute(USER_LOGIN_STATE, user);
+
+            //使用Sa-token 登录， 并指定设备，同端登录互斥
+            StpUtil.login(user.getId(), DeviceUtils.getRequestDevice(request));
             return getLoginUserVO(user);
         }
     }
@@ -149,18 +236,24 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
      */
     @Override
     public User getLoginUser(HttpServletRequest request) {
+        //基于sa-token获取
+        Object loginUserId = StpUtil.getLoginIdDefaultNull();
+        ThrowUtils.throwIf(loginUserId == null, ErrorCode.NOT_FOUND_ERROR);
         // 先判断是否已登录
-        Object userObj = request.getSession().getAttribute(USER_LOGIN_STATE);
-        User currentUser = (User) userObj;
-        if (currentUser == null || currentUser.getId() == null) {
-            throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR);
-        }
+//        Object userObj = request.getSession().getAttribute(USER_LOGIN_STATE);
+//        User currentUser = (User) userObj;
+//        if (currentUser == null || currentUser.getId() == null) {
+//            throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR);
+//        }
         // 从数据库查询（追求性能的话可以注释，直接走缓存）
-        long userId = currentUser.getId();
-        currentUser = this.getById(userId);
+//        long userId = currentUser.getId();
+        User currentUser = this.getById((String)loginUserId);
         if (currentUser == null) {
             throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR);
         }
+
+        //或者直接返回
+//        User object = (User) StpUtil.getSession().get(USER_LOGIN_STATE);
         return currentUser;
     }
 
@@ -173,14 +266,12 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
     @Override
     public User getLoginUserPermitNull(HttpServletRequest request) {
         // 先判断是否已登录
-        Object userObj = request.getSession().getAttribute(USER_LOGIN_STATE);
-        User currentUser = (User) userObj;
-        if (currentUser == null || currentUser.getId() == null) {
+        Object loginUserId = StpUtil.getLoginIdDefaultNull();
+        if (loginUserId == null ) {
             return null;
         }
         // 从数据库查询（追求性能的话可以注释，直接走缓存）
-        long userId = currentUser.getId();
-        return this.getById(userId);
+        return this.getById((String)loginUserId);
     }
 
     /**
@@ -209,11 +300,14 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
      */
     @Override
     public boolean userLogout(HttpServletRequest request) {
-        if (request.getSession().getAttribute(USER_LOGIN_STATE) == null) {
-            throw new BusinessException(ErrorCode.OPERATION_ERROR, "未登录");
-        }
-        // 移除登录态
-        request.getSession().removeAttribute(USER_LOGIN_STATE);
+//        if (request.getSession().getAttribute(USER_LOGIN_STATE) == null) {
+//            throw new BusinessException(ErrorCode.OPERATION_ERROR, "未登录");
+//        }
+//        // 移除登录态
+//        request.getSession().removeAttribute(USER_LOGIN_STATE);
+        StpUtil.checkLogin();
+        //移出登录态
+        StpUtil.logout();
         return true;
     }
 
